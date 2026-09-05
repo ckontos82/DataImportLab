@@ -10,6 +10,9 @@ public static class CustomerImportsServiceCollection
             System.Text.CodePagesEncodingProvider.Instance);
 
         services.AddScoped<CustomerExcelReader>();
+        services.AddScoped<ImportExcelJobRepository>();
+        services.AddScoped<ImportExcelStagingRepository>();
+        services.AddScoped<ImportExcelHandler>();
 
         return services;
     }

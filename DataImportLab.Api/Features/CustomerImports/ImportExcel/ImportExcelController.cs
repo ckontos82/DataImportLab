@@ -4,11 +4,11 @@ namespace DataImportLab.Api.Features.CustomerImports.ImportExcel;
 
 [ApiController]
 [Route("api/imports/customers")]
-public class ImportExcelController(CustomerExcelReader excelReader) : ControllerBase
+public class ImportExcelController(ImportExcelHandler handler) : ControllerBase
 {
     [HttpPost("excel")]
     [Consumes("multipart/form-data")]
-    public IActionResult Import(IFormFile file)
+    public async Task<IActionResult> Import(IFormFile file, CancellationToken cancellationToken)
     {
         if (file.Length == 0)
             return BadRequest("Το αρχείο είναι κενό.");
@@ -16,13 +16,15 @@ public class ImportExcelController(CustomerExcelReader excelReader) : Controller
         try
         {
             using var stream = file.OpenReadStream();
-            var totalRows = excelReader.ReadRows(stream).Count();
+            var result = await handler.HandleAsync(stream, file.FileName, cancellationToken);
 
             return Ok(new
             {
                 fileName = file.FileName,
                 sizeInBytes = file.Length,
-                totalRows
+                jobId = result.JobId,
+                totalRows = result.TotalRows,
+                status = result.Status
             });
         }
         catch (InvalidExcelImportException ex)

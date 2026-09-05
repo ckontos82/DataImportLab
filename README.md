@@ -4,7 +4,7 @@ A hands-on ASP.NET Core project for practicing customer data imports before appl
 
 The planned workflow is **Excel → staging → validation → customers**, followed by XML inserts and updates with duplicate-operation protection. Development proceeds in small, working steps, starting with synchronous request processing.
 
-**Current milestone:** upload an Excel workbook, validate its worksheet and headers, read customer rows, and return their count. SQL Server connection infrastructure is present; database writes and XML processing are still planned.
+**Current milestone:** upload an Excel workbook, create an import job, validate its worksheet and headers, and write raw customer rows to SQL Server staging in batches. Customer-value validation, promotion to `customers`, and XML processing are still planned.
 
 ## Current capabilities
 
@@ -14,13 +14,16 @@ The planned workflow is **Excel → staging → validation → customers**, foll
 - Read rows using ExcelDataReader and expose them as `IEnumerable<RawCustomerRow>`.
 - Preserve the source row number for future validation error reporting.
 - Represent incoming fields as nullable text, using invariant formatting for numbers and `yyyy-MM-dd` for parsed dates.
-- Return the filename, file size, and number of data rows.
+- Create a `RUNNING` import job and write staging rows using `SqlBulkCopy` in batches of 1,000.
+- Commit all staging batches and the job's total count in one transaction, then leave the job `PENDING` for future validation.
+- Roll back staging on failure and attempt to record `FAILED` on the separately persisted job.
+- Return the filename, file size, job ID, number of staged rows, and job status.
 - Return HTTP 400 for known worksheet/header errors through a feature-specific exception.
 - Expose OpenAPI and Scalar in the Development environment.
 - Register feature and persistence dependencies through `IServiceCollection` extension methods.
 - Enforce file-scoped namespaces with compiler-build and editor warnings.
 
-The endpoint currently counts all rows returned after the header, including rows containing invalid business data. It does not yet save uploaded files, create import jobs, validate customer values, or persist customers.
+The endpoint stages all rows returned after the header, including rows containing invalid business data. It does not yet save the original file, validate customer values, or insert accepted customers into `customers`.
 
 ## Technology
 
@@ -50,9 +53,13 @@ DataImportLab/
     │       ├── CustomerImportsServiceCollection.cs
     │       └── ImportExcel/
     │           ├── ImportExcelController.cs
+    │           ├── ImportExcelHandler.cs
+    │           ├── ImportExcelJobRepository.cs
+    │           ├── ImportExcelStagingRepository.cs
     │           ├── CustomerExcelReader.cs
     │           ├── InvalidExcelImportException.cs
     │           └── Models/
+    │               ├── ImportExcelResult.cs
     │               └── RawCustomerRow.cs
     ├── Infrastructure/
     │   └── Persistence/
@@ -72,20 +79,24 @@ The current request flow is:
 ```text
 Multipart upload
     → ImportExcelController
-    → CustomerExcelReader.ReadRows(stream)
-    → worksheet and header checks
-    → RawCustomerRow objects, yielded one at a time
-    → Count()
-    → HTTP response
+    → ImportExcelHandler creates a RUNNING job
+    → transaction: read and check workbook → stage batches → update job
+    → commit → HTTP response with jobId, totalRows, and PENDING status
+
+Failure after job creation
+    → rollback staging transaction → mark job FAILED → propagate error
 ```
 
-- **Controller:** owns the uploaded stream, invokes the reader, and maps expected import failures to HTTP responses.
+- **Controller:** owns the uploaded stream, invokes the handler with a filename and cancellation token, and maps expected import failures to HTTP responses.
+- **Handler:** coordinates job creation, reading, the staging transaction, and job status updates. It does not return HTTP responses.
+- **Job repository:** creates job records and updates their status and counters with parameterized SQL.
+- **Staging repository:** maps raw rows to a reusable `DataTable` of at most 1,000 rows and writes each batch through `SqlBulkCopy` with explicit column mappings.
 - **Reader:** knows the Excel layout and returns raw rows. It has no dependency on HTTP responses or SQL Server.
 - **RawCustomerRow:** a record with `SourceRow` and nullable string properties for incoming values. It represents unvalidated data.
 - **SqlConnectionFactory:** creates a new, closed `SqlConnection` on each call. The caller will open and dispose the connection. The singleton registration applies to the factory, not to a shared connection.
 - **Registration extensions:** `AddCustomerImports()` and `AddPersistence(configuration)` keep individual service registrations out of `Program.cs`.
 
-The reader uses deferred execution: reading and exceptions occur while the sequence is enumerated. The controller therefore calls `Count()` inside its `try` block while the uploaded stream remains open. The reader leaves that stream open for its owner to dispose.
+The reader uses deferred execution: reading and exceptions occur while the staging repository enumerates the sequence. The controller awaits the handler inside its `try` block while the uploaded stream remains open. The reader leaves that stream open for its owner to dispose.
 
 This avoids building an application-level list of all customer rows. It does not imply that HTTP uploads are unbuffered: `IFormFile` uses ASP.NET Core's upload handling, which can buffer content in memory or temporary files.
 
@@ -96,9 +107,9 @@ This avoids building an application-level list of all customer rows. It does not
 - The [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0).
 - A development environment supporting .NET 10, or a terminal.
 - An `.xlsx` workbook matching the format below. Microsoft Excel does not need to be installed on the API host.
-- For the upcoming database steps: a local SQL Server Express instance and a database named `ImportDb`.
+- A local SQL Server Express instance and a database named `ImportDb`, with the practice SQL Server schema applied.
 
-The documented SQL configuration uses Windows Authentication. The current counting endpoint does not connect to SQL Server, but application startup requires a nonempty `ImportDb` connection string because persistence is registered at startup.
+The documented SQL configuration uses Windows Authentication. Application startup requires a nonempty `ImportDb` connection string. Upload requests now require a reachable database with the expected tables and write permissions for the Windows identity running the API.
 
 ### Configure the connection string
 
@@ -121,6 +132,8 @@ For other environments, supply `ConnectionStrings:ImportDb` through configuratio
 If startup reports `Λείπει το connection string ImportDb.`, check the configuration key as well as its value. `AddPersistence` looks for **`ImportDb`** specifically. This configuration key is separate from the database name, **`ImportDb`**, inside the connection string.
 
 ### Restore and build
+
+Before uploading a workbook, create `ImportDb` and apply the separate practice pack's `schema_mssql.sql` to it. In SSMS, select `ImportDb` as the query database before executing the schema. If using `sqlcmd`, pass `-d ImportDb -I`; `-I` enables `QUOTED_IDENTIFIER`, which is required by the computed-column index in the schema.
 
 Run from the repository root:
 
@@ -189,11 +202,11 @@ Store identifiers such as `vat_number` as text when leading zeros matter. A numb
 
 Existing string values are preserved, including invalid values. Parsed numbers use invariant culture and parsed `DateTime` values become `yyyy-MM-dd`. Cell formatting and time-of-day information are not retained. Business validation is a later step.
 
-A worksheet with no readable rows is rejected. A worksheet containing only valid headers returns `totalRows: 0`. There is no explicit blank-data-row filter.
+A worksheet with no readable rows is rejected. A worksheet containing only valid headers creates a pending job with `totalRows: 0`. There is no explicit blank-data-row filter. Values exceeding the staging capacity (100 characters for `customer_id`, 4,000 for other raw fields) reject the file without truncation; all its staging batches are rolled back.
 
 ## API usage
 
-### Upload and count customer rows
+### Upload and stage customer rows
 
 ```http
 POST /api/imports/customers/excel
@@ -218,11 +231,15 @@ Illustrative successful response:
 {
   "fileName": "customers.xlsx",
   "sizeInBytes": 1074829,
-  "totalRows": 20000
+  "jobId": 1,
+  "totalRows": 20000,
+  "status": "PENDING"
 }
 ```
 
-`sizeInBytes` depends on the uploaded file. `totalRows` excludes the header and is a read count, not a count of validated or saved customers.
+`sizeInBytes` depends on the uploaded file, and `jobId` is generated by SQL Server. `totalRows` excludes the header and counts staged rows, not validated customers. Re-uploading a workbook creates a separate job and a separate set of staging rows.
+
+`PENDING` means staging succeeded and the job is awaiting the future validation step. There is no background worker or automatic continuation yet. `processed_rows`, `accepted_rows`, and `rejected_rows` remain zero, and `completed_at` remains null. A successful staging response does not mean the full customer import is complete.
 
 ### Error responses
 
@@ -246,12 +263,15 @@ Current application error messages are in Greek.
 | Missing `Customers` worksheet | HTTP 400, Problem Details |
 | Worksheet with no readable rows | HTTP 400, Problem Details |
 | Unexpected column count or header | HTTP 400, Problem Details |
-| Invalid customer values | Still read and counted; business validation is not implemented |
+| Filename outside 1–255 characters, or raw value exceeding staging capacity | HTTP 400, Problem Details |
+| Invalid customer values that fit staging | Stored as raw text; business validation is not implemented |
 | Corrupt, unsupported, or password-protected workbook | Library exceptions are not yet translated into the custom HTTP 400 response and can result in HTTP 500 |
+
+After a job is created, failures roll back the staging transaction. The handler then attempts to mark the job `FAILED` with a completion timestamp, using a separate connection and a 10-second timeout even if the request was cancelled. If SQL Server is unavailable for that update, the failure is logged and the job can remain `RUNNING`. The original exception is preserved. Import error-table persistence is not implemented yet.
 
 ## Database direction
 
-The local practice database is named `ImportDb`. The planned SQL Server schema consists of:
+The local practice database is named `ImportDb`. The applied SQL Server schema consists of:
 
 | Table | Intended responsibility |
 | --- | --- |
@@ -263,13 +283,13 @@ The local practice database is named `ImportDb`. The planned SQL Server schema c
 
 The SQL scripts and synthetic practice files are currently maintained outside this repository. There is no migration or automatic schema creation in the API. When using the separate practice pack, select **`schema_mssql.sql`**; the original PostgreSQL `schema.sql` is not the selected schema.
 
-The next persistence milestone is creating an import job and returning its generated ID, followed by `SqlBulkCopy` batches into staging. Business validation and transfer to `customers` will follow.
+Job creation and transactional staging are implemented. The handler creates the audit job outside the staging transaction, so a failed import can retain a job record while its partial staging writes are rolled back. Business validation and transfer to `customers` are the next steps.
 
 ## Practice data and expected outcomes
 
 The separate synthetic practice pack contains `customers.xlsx`, `customer_updates.xml`, `schema_mssql.sql`, and `expected_issues.csv`. These files are **not included in this repository**. You can exercise the current endpoint with a workbook you create using the documented input contract.
 
-The Excel practice file contains 20,000 data rows, including 10 intentional problems. The current endpoint should report **20,000**. Once business validation is implemented, the intended result is **19,990 accepted** and **10 rejected**, keeping the earlier occurrence of a duplicate customer ID.
+The Excel practice file contains 20,000 data rows, including 10 intentional problems. The current endpoint should stage and report **20,000**. Once business validation is implemented, the intended result is **19,990 accepted** and **10 rejected**, keeping the earlier occurrence of a duplicate customer ID.
 
 Planned customer checks include required values, field lengths, email format and uniqueness, allowed statuses (`ACTIVE`, `INACTIVE`, `PENDING`), nonnegative balances, nine-digit VAT numbers, and `updated_at >= created_at`. The VAT rule checks digit format, not the Greek tax-number checksum.
 
@@ -283,14 +303,18 @@ There is currently no automated test project. Useful checks through Scalar are:
 
 | Test | Expected result |
 | --- | --- |
-| Upload the original practice workbook | HTTP 200, `totalRows: 20000` |
+| Upload the original practice workbook | HTTP 200, `totalRows: 20000`, `status: PENDING`, and 20,000 staging rows linked to the returned job ID |
 | Rename the worksheet to `Other` in a copy | HTTP 400: worksheet not found |
 | Rename `email` to `email_to_send` in a copy | HTTP 400 identifying column 4 and both header names |
 | Move `Customers` behind another worksheet | Same count; the reader locates the target worksheet first |
 | Change header casing or add surrounding whitespace | Accepted |
 | Upload a workbook with valid headers and no data rows | HTTP 200, `totalRows: 0` |
+| Upload 1,001 validly structured rows | Both the full batch and the final single row are staged |
+| Exceed the staging field capacity after the first 1,000 rows | HTTP 400; job becomes `FAILED` and no staging rows remain for it |
 
 Use copies for negative tests so the original fixture retains its intentional business-data errors.
+
+Local smoke checks verified the 20,000-row fixture, partial final batches, preservation of invalid raw values, header failures, and rollback after an already-written batch. The temporary test jobs and staging rows were removed afterward. These checks are not yet a committed automated test suite.
 
 ## Coding conventions
 
@@ -306,9 +330,9 @@ Keep feature-specific models and behavior beside their feature, and register dep
 
 ## Next milestones
 
-- [ ] Add `ImportExcelHandler` to coordinate reading and persistence.
-- [ ] Create and update `import_jobs` records.
-- [ ] Load staging rows in batches with `SqlBulkCopy`.
+- [x] Add `ImportExcelHandler` to coordinate reading and persistence.
+- [x] Create and update `import_jobs` records for staging and failure.
+- [x] Load staging rows in batches with `SqlBulkCopy`.
 - [ ] Validate incoming values and record errors with source-row references.
 - [ ] Insert accepted customers with defined transaction and failure behavior.
 - [ ] Add job status and error-retrieval endpoints.
